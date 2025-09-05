@@ -142,7 +142,8 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = torch.cat([head(x) for head in self.heads], dim=-1)
-        return self.dropout(self.projection(output))
+        output = self.projection(output)
+        return self.dropout(output)
 
 
 # Header / Multiheader lacks non-linear acivation. Its softmax
