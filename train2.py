@@ -7,14 +7,17 @@ from typing import Union
 torch.manual_seed(1337)
 
 # Constants.
-batch_size = 32
-block_size = 8
+batch_size = 64
+block_size = 256
 device = "cuda" if torch.cuda.is_available() else "mps"
+dropout = 0.2
 eval_interval = 500
-eval_iters = 200
-learning_rate = 1e-3
+eval_iters = 500
+learning_rate = 3e-4
 max_iters = 5000
-n_embed = 32
+n_embed = 384
+n_head = 6
+n_layer = 6
 
 with open("input.txt", "r", encoding="utf-8") as f:
     text = f.read()
@@ -82,20 +85,22 @@ class Head(nn.Module):
         # register_buffer will not store the var in parameters. So it won't be updated.
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
-    def forward(self, indices: torch.Tensor):
-        B, T, C = indices.shape
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
 
         # [[1 0]  <- I. 'I' has label feature.
         #  [1 1]  <- love. 'love' has 2nd label.
         #  [0 1]] <- dog. 'dog'. dog has both labels.
-        k = self.key(indices)  # batch_size, block_size, head_size
+        k = self.key(x)  # batch_size, block_size, head_size
 
         # [[1 0]  <- I. 'I' interests in the first label in attention
         #  [0 1]  <- love. 'love' interests in the 2nd label in attention
         #  [1 1]] <- dog. 'dog' interests in both labels in attention
-        q = self.query(indices)  # batch_size, block_size, head_size
+        q = self.query(x)  # batch_size, block_size, head_size
 
-        v = self.value(indices)  # batch_size, block_size, head_size
+        v = self.value(x)  # batch_size, block_size, head_size
 
         # q@k^T has a overall weight on what token (represented by row), interests on other
         # [[1 1 0]  <- I
@@ -115,8 +120,76 @@ class Head(nn.Module):
         # must reset weight. masked_fill will not update in place.
         weights = weights.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         weights = F.softmax(weights, dim=-1)
+        weights = self.dropout(weights)
         output = weights @ v  # batch_size, block_size, n_embed
         return output
+
+
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, n_head: int, head_size: int) -> None:
+        super().__init__()
+        # Need to register ModuleList so each sub-Module's params could be
+        # discovered by optimizer.
+        self.heads = nn.ModuleList([Head(head_size) for i in range(n_head)])
+
+        # torch.concat just physically concat the info from multi heads, but they
+        # are isolated from each other. Having a project layer merges the info
+        # in mutli-heads.
+        self.projection = nn.Linear(n_embed, n_embed)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output = torch.cat([head(x) for head in self.heads], dim=-1)
+        return self.dropout(self.projection(output))
+
+
+# Header / Multiheader lacks non-linear acivation. Its softmax
+# softmax(q@k^T * d^-0.5) @ v
+# occurs before dot product with value (v). So technically, it is
+# still just a linear transformation.
+class FeedForward(nn.Module):
+
+    def __init__(self, n_embed: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, n_embed * 4),
+            nn.ReLU(),
+            # This is also a projection layer. The feedforward usually
+            # expands to high dimension to learn more features. So we need
+            # another linear layer to map it back to n_embed.
+            nn.Linear(n_embed * 4, n_embed),
+            # to avoid overfitting by drop some random nerous.
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Block(nn.Module):
+
+    def __init__(self, n_embed: int, n_head: int) -> None:
+        super().__init__()
+        head_size = n_embed // n_head
+        self.multi_head = MultiHeadAttention(n_head, head_size)
+        self.feed_forward = FeedForward(n_embed)
+        # just like batch norm, this is normalize the data to avoid grad explosion.
+        # this is applied together with residual connection.
+        self.layer_norm1 = nn.LayerNorm(n_embed)
+        self.layer_norm2 = nn.LayerNorm(n_embed)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # This is residual connections. x = x + layer(x)
+        # It helps to preserve the graident in very deep neural network. Because
+        # it is "+". The grad is distributed between the layer and the x itself.
+        # So if the layer didn't learn anything. The grad will at least be 1 instead
+        # of 0. Residual connection is to help grad -> 0.
+        # To help grad too large, batchNorm is the way to go.
+        x = x + self.multi_head(self.layer_norm1(x))
+        x = x + self.feed_forward(self.layer_norm2(x))
+        return x
 
 
 class BigramLanguageModule(nn.Module):
@@ -126,7 +199,11 @@ class BigramLanguageModule(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
         # keep head_size the same as embedding to align.
-        self.sa_head = Head(head_size=n_embed)
+        # self.sa_head = Head(head_size=n_embed)
+        # self.multi_head = MultiHeadAttention(n_head=4, head_size=n_embed // 4)
+        # self.feed_forward = FeedForward(n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_head) for _ in range(n_layer)])
+        self.layer_norm = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(
@@ -141,7 +218,8 @@ class BigramLanguageModule(nn.Module):
             torch.arange(T, device=device)
         )  # (block, n_embed)
         x = token_embeddings + position_embeddings  # (batch, block, n_embed)
-        x = self.sa_head(x)
+        x = self.blocks(x)
+        x = self.layer_norm(x)
         logits = self.lm_head(x)  # (batch, block, vocab_size)
 
         if targets is None:
@@ -193,4 +271,4 @@ for iter in range(max_iters):
 print("training time elpased: ", datetime.now() - now)
 
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=100)[0].tolist()))
+print(decode(m.generate(context, max_new_tokens=1000)[0].tolist()))
